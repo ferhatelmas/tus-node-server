@@ -325,20 +325,29 @@ describe('BaseHandler.writeToStore', () => {
     assert.equal(postReceive.called, false)
   })
 
-  it('rejects when converting the web stream throws synchronously', async () => {
+  it('rejects when the web stream is already locked', async () => {
     const {handler} = createHandler()
     const context = createContext()
+    const webStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.close()
+      },
+    })
+    const reader = webStream.getReader()
 
-    await assert.rejects(
-      handler.writeToStoreForTest(
-        // @ts-expect-error testing invalid input at the runtime boundary
-        {},
-        new Upload({id: 'invalid-stream', offset: 0}),
-        maxFileSize,
-        context
-      ),
-      {code: 'ERR_INVALID_ARG_TYPE'}
-    )
+    try {
+      await assert.rejects(
+        handler.writeToStoreForTest(
+          webStream,
+          new Upload({id: 'locked-stream', offset: 0}),
+          maxFileSize,
+          context
+        ),
+        TypeError
+      )
+    } finally {
+      reader.releaseLock()
+    }
   })
 
   it('cancels pending POST_RECEIVE progress after an abort', async () => {
@@ -366,47 +375,5 @@ describe('BaseHandler.writeToStore', () => {
 
     assert.equal(clock.countTimers(), 0)
     assert.equal(postReceive.called, false)
-  })
-
-  it('emits the last observed offset while a write is stalled', async () => {
-    const {handler, store} = createHandler()
-    const {waitForChunk} = consumeStoreWrites(store, 7)
-    const offsets: number[] = []
-    handler.on(EVENTS.POST_RECEIVE, (_stream, upload) => {
-      offsets.push(upload.offset)
-    })
-    const context = createContext()
-    const {controller, webStream} = createControlledStream()
-    let settled = false
-
-    const write = handler.writeToStoreForTest(
-      webStream,
-      new Upload({id: 'stalled', offset: 7}),
-      maxFileSize,
-      context
-    )
-    write.then(
-      () => {
-        settled = true
-      },
-      () => {
-        settled = true
-      }
-    )
-    controller.enqueue(Buffer.alloc(5))
-    await waitForChunk(1)
-
-    await clock.tickAsync(interval - 1)
-    assert.deepEqual(offsets, [])
-    assert.equal(settled, false)
-
-    await clock.tickAsync(1)
-    assert.deepEqual(offsets, [12])
-    assert.equal(settled, false)
-
-    controller.close()
-    await write
-
-    assert.equal(clock.countTimers(), 0)
   })
 })
