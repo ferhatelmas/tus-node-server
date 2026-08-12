@@ -2,7 +2,7 @@ import {strict as assert} from 'node:assert'
 import type {Readable} from 'node:stream'
 
 import {MemoryLocker} from '@tus/server'
-import {type CancellationContext, DataStore, EVENTS, Upload} from '@tus/utils'
+import {type CancellationContext, DataStore, ERRORS, EVENTS, Upload} from '@tus/utils'
 import sinon from 'sinon'
 
 import {BaseHandler} from '../handlers/BaseHandler.js'
@@ -293,8 +293,9 @@ describe('BaseHandler.writeToStore', () => {
     assert.deepEqual(offsets, [14, 17, 19])
   })
 
-  it('cancels pending POST_RECEIVE progress after a store error', async () => {
+  it('cancels pending POST_RECEIVE progress after a store error without cancelling the request', async () => {
     const {handler, store} = createHandler()
+    const cancel = sinon.spy()
     const error = new Error('store failed')
     store.write.callsFake(async (readable: Readable) => {
       for await (const _chunk of readable) {
@@ -308,8 +309,8 @@ describe('BaseHandler.writeToStore', () => {
     const webStream = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(Buffer.from('chunk'))
-        controller.close()
       },
+      cancel,
     })
 
     await assert.rejects(
@@ -323,6 +324,7 @@ describe('BaseHandler.writeToStore', () => {
 
     assert.equal(clock.countTimers(), 0)
     assert.equal(postReceive.called, false)
+    assert.equal(cancel.called, false)
   })
 
   it('rejects when the web stream is already locked', async () => {
@@ -375,5 +377,97 @@ describe('BaseHandler.writeToStore', () => {
 
     assert.equal(clock.countTimers(), 0)
     assert.equal(postReceive.called, false)
+  })
+
+  it('keeps abort semantics when the request stream errors after abort', async () => {
+    const {handler, store} = createHandler()
+    const {waitForChunk} = consumeStoreWrites(store)
+    const postReceive = sinon.spy()
+    handler.on(EVENTS.POST_RECEIVE, postReceive)
+    const context = createContext()
+    const {controller, webStream} = createControlledStream()
+    const streamError = new Error('request failed after abort')
+
+    const write = handler.writeToStoreForTest(
+      webStream,
+      new Upload({id: 'abort-then-error', offset: 0}),
+      maxFileSize,
+      context
+    )
+    controller.enqueue(Buffer.from('chunk'))
+    await waitForChunk(1)
+
+    assert.equal(clock.countTimers(), 1)
+
+    context.abort()
+    controller.error(streamError)
+    assert.equal(await write, 5)
+
+    assert.equal(clock.countTimers(), 0)
+    assert.equal(postReceive.called, false)
+  })
+
+  it('maps asynchronous web stream errors to an aborted request and cleans up', async () => {
+    const {handler, store} = createHandler()
+    const {waitForChunk} = consumeStoreWrites(store)
+    const postReceive = sinon.spy()
+    handler.on(EVENTS.POST_RECEIVE, postReceive)
+    const context = createContext()
+    const {controller, webStream} = createControlledStream()
+    const streamError = new Error('async body stream failed')
+
+    const write = handler.writeToStoreForTest(
+      webStream,
+      new Upload({id: 'stream-error', offset: 0}),
+      maxFileSize,
+      context
+    )
+    controller.enqueue(Buffer.from('chunk'))
+    await waitForChunk(1)
+
+    assert.equal(clock.countTimers(), 1)
+
+    controller.error(streamError)
+
+    await assert.rejects(write, (error: unknown) => {
+      assert.equal(error, ERRORS.ABORTED)
+      return true
+    })
+
+    assert.equal(clock.countTimers(), 0)
+    assert.equal(postReceive.called, false)
+  })
+
+  it('keeps source-error abort classification when the context is aborted afterward', async () => {
+    const {handler, store} = createHandler()
+    const {waitForChunk} = consumeStoreWrites(store)
+    const context = createContext()
+    const {controller, webStream} = createControlledStream()
+    const streamError = new Error('request stream failed')
+
+    handler.once(EVENTS.POST_RECEIVE, (nodeStream: Readable) => {
+      nodeStream.once('error', () => {
+        context.abort()
+      })
+    })
+
+    const write = handler.writeToStoreForTest(
+      webStream,
+      new Upload({id: 'stream-error-then-abort', offset: 0}),
+      maxFileSize,
+      context
+    )
+    controller.enqueue(Buffer.from('chunk'))
+    await waitForChunk(1)
+    await clock.tickAsync(interval)
+
+    controller.error(streamError)
+
+    await assert.rejects(write, (error: unknown) => {
+      assert.equal(error, ERRORS.ABORTED)
+      return true
+    })
+    assert.equal(context.signal.aborted, true)
+    assert.equal(clock.countTimers(), 0)
   })
 })

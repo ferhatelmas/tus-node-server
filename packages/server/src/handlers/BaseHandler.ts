@@ -1,11 +1,10 @@
 import EventEmitter from 'node:events'
-
-import type {ServerOptions} from '../types.js'
-import type {DataStore, CancellationContext} from '@tus/utils'
-import {ERRORS, type Upload, StreamLimiter, EVENTS} from '@tus/utils'
-import throttle from 'lodash.throttle'
-import stream from 'node:stream/promises'
 import {PassThrough, Readable} from 'node:stream'
+import stream from 'node:stream/promises'
+import type {CancellationContext, DataStore} from '@tus/utils'
+import {ERRORS, EVENTS, StreamLimiter, type Upload} from '@tus/utils'
+import throttle from 'lodash.throttle'
+import type {ServerOptions} from '../types.js'
 
 const reExtractFileID = /([^/]+)\/?$/
 const reForwardedHost = /host="?([^";]+)/
@@ -159,18 +158,30 @@ export class BaseHandler extends EventEmitter {
     // This allows for aborting the write process without affecting the incoming request stream.
     const proxy = new PassThrough()
     const nodeStream = webStream ? Readable.fromWeb(webStream) : Readable.from([])
+    let sourceError: unknown
+    let hasSourceError = false
 
-    // Ignore errors on the data stream to prevent crashes from client disconnections.
-    // The pipeline handles errors emitted by the proxy stream instead.
-    nodeStream.on('error', () => {
-      /* do nothing */
+    // Pipe does not forward source errors to the destination.
+    // Handle source errors here so that pipeline rejects,
+    // without destroying underlying request.
+    nodeStream.on('error', (error) => {
+      sourceError = error
+      hasSourceError = true
+      nodeStream.unpipe(proxy)
+
+      // Server handler will destroy the proxy stream if the request is aborted
+      // so we only destroy the proxy if the request is still active.
+      if (!context.signal.aborted) {
+        proxy.destroy(error)
+      }
     })
 
     // gracefully terminate the proxy stream when the request is aborted
     const onAbort = () => {
       nodeStream.unpipe(proxy)
 
-      if (!proxy.closed) {
+      // A source error may have already destroyed the proxy stream, end only if still active.
+      if (!proxy.destroyed) {
         proxy.end()
       }
     }
@@ -207,7 +218,10 @@ export class BaseHandler extends EventEmitter {
       )
     } catch (error) {
       nodeStream.unpipe(proxy)
-      throw error instanceof Error && error.name === 'AbortError' ? ERRORS.ABORTED : error
+      const isSourceError = hasSourceError && error === sourceError
+      const isAbortError = error instanceof Error && error.name === 'AbortError'
+
+      throw isSourceError || isAbortError ? ERRORS.ABORTED : error
     } finally {
       postReceive?.cancel()
       context.signal.removeEventListener('abort', onAbort)
