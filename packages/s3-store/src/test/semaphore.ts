@@ -67,3 +67,52 @@ describe('Permit', () => {
     assert.ok((await thirdPermitPromise) instanceof Permit)
   })
 })
+
+describe('Semaphore cancellation', () => {
+  it('rejects an already aborted acquisition without taking a permit', async () => {
+    const semaphore = new Semaphore(1)
+    const controller = new AbortController()
+    const reason = new Error('cancelled')
+    controller.abort(reason)
+
+    await assert.rejects(
+      semaphore.acquire(controller.signal),
+      (error) => error === reason
+    )
+    const permit = await semaphore.acquire()
+    await permit.release()
+  })
+
+  it('removes a cancelled waiter and preserves FIFO order for the rest', async () => {
+    const semaphore = new Semaphore(1)
+    const first = await semaphore.acquire()
+    const controller = new AbortController()
+    const reason = new Error('cancelled')
+    const cancelled = semaphore.acquire(controller.signal)
+    const rejected = assert.rejects(cancelled, (error) => error === reason)
+    const next = semaphore.acquire()
+    controller.abort(reason)
+    await rejected
+
+    await first.release()
+    const permit = await next
+    await permit.release()
+    const available = await semaphore.acquire()
+    await available.release()
+  })
+
+  it('keeps a permit granted just before its signal is aborted', async () => {
+    const semaphore = new Semaphore(1)
+    const first = await semaphore.acquire()
+    const controller = new AbortController()
+    const pending = semaphore.acquire(controller.signal)
+
+    const releasing = first.release()
+    controller.abort(new Error('cancelled after grant'))
+    await releasing
+    const granted = await pending
+    await granted.release()
+    const available = await semaphore.acquire()
+    await available.release()
+  })
+})

@@ -23,6 +23,10 @@ export class StreamSplitter extends stream.Writable {
   filenameTemplate: string
   chunkSize: Options['chunkSize']
   part: number
+  private activeOperation?: Promise<void>
+  private waitingForChunkStart = false
+  private cleanupOperation?: Promise<void>
+  private handedOffChunkPath: string | null = null
 
   constructor({chunkSize, directory}: Options, options?: stream.WritableOptions) {
     super(options)
@@ -33,72 +37,112 @@ export class StreamSplitter extends stream.Writable {
     this.directory = directory
     this.filenameTemplate = randomString(10)
     this.part = 0
-
-    this.on('error', this._handleError.bind(this))
+    // Errors do not trigger _destroy when autoDestroy is disabled.
+    this.on('error', () => {
+      if (!this.destroyed) {
+        this.cleanup().catch((error) => this.destroy(error))
+      }
+    })
   }
 
-  async _write(chunk: Buffer, _: BufferEncoding, callback: Callback) {
-    try {
-      // In order to start writing a chunk, we must first create
-      // a file system reference for it
-      if (this.fileHandle === null) {
-        await this._newChunk()
-      }
+  _write(chunk: Buffer, _: BufferEncoding, callback: Callback) {
+    const operation = this.writeData(chunk)
+    this.activeOperation = operation
+    operation.then(() => callback(null), callback)
+  }
 
-      let overflow = this.currentChunkSize + chunk.length - this.chunkSize
+  private async writeData(chunk: Buffer): Promise<void> {
+    if (this.fileHandle === null) {
+      await this._newChunk()
+    }
+    this.checkDestroyed()
 
-      // The current chunk will be more than our defined part size if we would
-      // write all of it to disk.
-      while (overflow > 0) {
-        // Only write to disk the up to our defined part size.
-        await this._writeChunk(chunk.subarray(0, chunk.length - overflow))
-        await this._finishChunk()
+    let overflow = this.currentChunkSize + chunk.length - this.chunkSize
+    while (overflow > 0) {
+      await this._writeChunk(chunk.subarray(0, chunk.length - overflow))
+      this.checkDestroyed()
+      await this._finishChunk()
+      this.checkDestroyed()
+      await this._newChunk()
+      this.checkDestroyed()
+      chunk = chunk.subarray(chunk.length - overflow, chunk.length)
+      overflow = this.currentChunkSize + chunk.length - this.chunkSize
+    }
 
-        // We still have some overflow left, so we write it to a new chunk.
-        await this._newChunk()
-        chunk = chunk.subarray(chunk.length - overflow, chunk.length)
-        overflow = this.currentChunkSize + chunk.length - this.chunkSize
-      }
+    await this._writeChunk(chunk)
+    this.checkDestroyed()
+  }
 
-      // The chunk is smaller than our defined part size so we can just write it to disk.
-      await this._writeChunk(chunk)
-      callback(null)
-    } catch (error) {
-      callback(error)
+  _final(callback: Callback) {
+    const operation = this._finishChunk()
+    this.activeOperation = operation
+    operation.then(() => callback(null), callback)
+  }
+
+  private checkDestroyed() {
+    if (this.destroyed) {
+      throw new Error('StreamSplitter was destroyed')
     }
   }
 
-  async _final(callback: Callback) {
-    if (this.fileHandle === null) {
-      callback(null)
+  _destroy(error: Error | null, callback: Callback) {
+    const waitingForChunkStart = this.waitingForChunkStart
+    if (!this.writableFinished) this.emit('chunkCancelled')
+
+    if (waitingForChunkStart) {
+      // No file exists yet. A listener may not support cancellation; its
+      // eventual completion will release any resource it acquired.
+      callback(error)
       return
     }
 
-    try {
-      await this._finishChunk()
-      callback(null)
-    } catch (error) {
-      callback(error)
-    }
+    this.cleanup().then(
+      () => callback(error),
+      (cleanupError) => callback(error ?? cleanupError)
+    )
+  }
+
+  private cleanup(): Promise<void> {
+    if (this.cleanupOperation) return this.cleanupOperation
+
+    this.cleanupOperation = (async () => {
+      // An open, write, or chunk handoff may still be running after destroy().
+      await this.activeOperation?.catch(() => {})
+      let failure: Error | undefined
+      try {
+        if (!this.writableFinished) {
+          await this.emitEvent(
+            'chunkError',
+            this.currentChunkPath ?? this.handedOffChunkPath
+          )
+        }
+      } catch (error) {
+        failure = error
+      }
+      try {
+        if (this.fileHandle !== null) await this.fileHandle.close()
+      } catch (error) {
+        failure ??= error
+      }
+      this.fileHandle = null
+      try {
+        if (this.currentChunkPath !== null) {
+          await fs.rm(this.currentChunkPath, {force: true})
+        }
+      } catch (error) {
+        failure ??= error
+      }
+      this.currentChunkPath = null
+      this.handedOffChunkPath = null
+      if (failure) throw failure
+    })()
+
+    return this.cleanupOperation
   }
 
   async _writeChunk(chunk: Buffer): Promise<void> {
     await fs.appendFile(this.fileHandle as fs.FileHandle, chunk)
     this.currentChunkSize += chunk.length
-  }
-
-  async _handleError() {
-    await this.emitEvent('chunkError', this.currentChunkPath)
-    // If there was an error, we want to stop allowing to write on disk as we cannot advance further.
-    // At this point the chunk might be incomplete advancing further might cause data loss.
-    // some scenarios where this might happen is if the disk is full or if we abort the stream midway.
-    if (this.fileHandle === null) {
-      return
-    }
-
-    await this.fileHandle.close()
-    this.currentChunkPath = null
-    this.fileHandle = null
   }
 
   async _finishChunk(): Promise<void> {
@@ -107,14 +151,18 @@ export class StreamSplitter extends stream.Writable {
     }
 
     await this.fileHandle.close()
+    this.checkDestroyed()
 
+    const chunkPath = this.currentChunkPath
+    this.fileHandle = null
+    this.currentChunkPath = null
+    this.handedOffChunkPath = chunkPath
     await this.emitEvent('chunkFinished', {
-      path: this.currentChunkPath,
+      path: chunkPath,
       size: this.currentChunkSize,
     })
 
-    this.currentChunkPath = null
-    this.fileHandle = null
+    this.handedOffChunkPath = null
     this.currentChunkSize = 0
     this.part += 1
   }
@@ -131,12 +179,21 @@ export class StreamSplitter extends stream.Writable {
       this.directory,
       `${this.filenameTemplate}-${this.part}`
     )
-    await this.emitEvent('beforeChunkStarted', currentChunkPath)
+    this.waitingForChunkStart = true
+    try {
+      await this.emitEvent('beforeChunkStarted', currentChunkPath)
+    } finally {
+      this.waitingForChunkStart = false
+      if (this.destroyed) {
+        await this.emitEvent('chunkError', null)
+      }
+    }
+    this.checkDestroyed()
+    this.fileHandle = await fs.open(currentChunkPath, 'w')
     this.currentChunkPath = currentChunkPath
-
-    const fileHandle = await fs.open(this.currentChunkPath, 'w')
-    await this.emitEvent('chunkStarted', this.currentChunkPath)
+    this.checkDestroyed()
+    await this.emitEvent('chunkStarted', currentChunkPath)
+    this.checkDestroyed()
     this.currentChunkSize = 0
-    this.fileHandle = fileHandle
   }
 }

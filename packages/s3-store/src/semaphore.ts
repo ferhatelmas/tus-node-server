@@ -56,17 +56,29 @@ export class Semaphore {
     this.availablePermits = count
   }
 
-  acquire(): Promise<Permit> {
+  acquire(signal?: AbortSignal): Promise<Permit> {
+    if (signal?.aborted) {
+      return Promise.reject(signal.reason)
+    }
     if (this.availablePermits > 0) {
       return Promise.resolve(this.createPermit())
-    } else {
-      const deferred = {} as Deferred
-      deferred.promise = new Promise((resolve) => {
-        deferred.resolve = resolve
-      })
-      this.deferreds.push(deferred)
-      return deferred.promise
     }
+
+    const deferred = {} as Deferred
+    deferred.promise = new Promise((resolve, reject) => {
+      const onAbort = () => {
+        const index = this.deferreds.indexOf(deferred)
+        if (index !== -1) this.deferreds.splice(index, 1)
+        reject(signal?.reason)
+      }
+      deferred.resolve = (permit) => {
+        signal?.removeEventListener('abort', onAbort)
+        resolve(permit)
+      }
+      signal?.addEventListener('abort', onAbort, {once: true})
+    })
+    this.deferreds.push(deferred)
+    return deferred.promise
   }
 
   private createPermit(): Permit {

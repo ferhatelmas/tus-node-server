@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import {createServer, type Server} from 'node:http'
 import type {AddressInfo} from 'node:net'
 import {tmpdir} from 'node:os'
-import {Readable} from 'node:stream'
+import {PassThrough, Readable} from 'node:stream'
 import {buffer} from 'node:stream/consumers'
 import stream from 'node:stream/promises'
 import {setTimeout as sleep} from 'node:timers/promises'
@@ -17,7 +17,8 @@ import sinon from 'sinon'
 import {S3Store, type MetadataValue} from '@tus/s3-store'
 import {Server as TusServer} from '@tus/server'
 import * as shared from '../../../utils/dist/test/stores.js'
-import {FileKvStore, StreamLimiter, Upload} from '@tus/utils'
+import {FileKvStore, StreamLimiter, StreamSplitter, Upload} from '@tus/utils'
+import {Semaphore, type Permit} from '../semaphore.js'
 
 const fixturesPath = path.resolve('../', '../', 'test', 'fixtures')
 const storePath = path.resolve('../', '../', 'test', 'output', 's3-store')
@@ -771,4 +772,187 @@ describe('S3DataStore', () => {
   shared.shouldWriteUploads()
   shared.shouldHandleOffset()
   shared.shouldDeclareUploadLength() // Creation-defer-length extension
+})
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: Error) => void
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done
+    reject = fail
+  })
+  return {promise, resolve, reject}
+}
+
+const metadata: MetadataValue = {
+  file: new Upload({id: 'upload-id', size: 100, offset: 0}),
+  'upload-id': 'multipart-id',
+  'tus-version': '1.0.0',
+}
+
+class TestStore extends S3Store {
+  constructor() {
+    super({
+      partSize: 4,
+      minPartSize: 4,
+      maxConcurrentPartUploads: 1,
+      s3ClientConfig: {
+        bucket: 'test',
+        region: 'us-east-1',
+        credentials: {accessKeyId: 'test', secretAccessKey: 'test'},
+      },
+    })
+  }
+
+  semaphore() {
+    return this.partUploadSemaphore
+  }
+
+  upload(input: Readable) {
+    return this.uploadParts(metadata, input, 1, 0)
+  }
+}
+
+class DelayedPartStore extends TestStore {
+  readonly partStarted = deferred<void>()
+  readonly finishPart = deferred<string>()
+
+  protected override async uploadPart(): Promise<string> {
+    this.partStarted.resolve()
+    return this.finishPart.promise
+  }
+}
+
+describe('S3Store uploadParts cancellation', () => {
+  it('releases a late permit from a non-cancellable start listener', async () => {
+    const directory = await fs.promises.mkdtemp(path.join(tmpdir(), 'splitter-cancel-'))
+    try {
+      const semaphore = new Semaphore(1)
+      const held = await semaphore.acquire()
+      const waiting = deferred<void>()
+      const released = deferred<void>()
+      let permit: Permit | undefined
+      const splitter = new StreamSplitter({chunkSize: 4, directory})
+      splitter.on('beforeChunkStarted', async () => {
+        const pending = semaphore.acquire()
+        waiting.resolve()
+        permit = await pending
+      })
+      splitter.on('chunkError', async () => {
+        await permit?.release()
+        released.resolve()
+      })
+      splitter.on('error', () => {})
+      const closed = new Promise<void>((resolve) => splitter.once('close', resolve))
+      splitter.write(Buffer.from('payload'))
+      await waiting.promise
+      splitter.destroy(new Error('aborted'))
+      await closed
+      await held.release()
+      await released.promise
+
+      const next = await semaphore.acquire()
+      await next.release()
+      assert.deepEqual(await fs.promises.readdir(directory), [])
+    } finally {
+      await fs.promises.rm(directory, {recursive: true, force: true})
+    }
+  })
+
+  it('removes an aborted waiter so the permit remains usable', async () => {
+    const store = new TestStore()
+    const semaphore = store.semaphore()
+    const held = await semaphore.acquire()
+    const waiting = deferred<void>()
+    const acquire = semaphore.acquire.bind(semaphore)
+    let pending: Promise<Permit> | undefined
+    semaphore.acquire = (signal) => {
+      const result = acquire(signal)
+      pending = result
+      waiting.resolve()
+      return result
+    }
+
+    const input = new PassThrough()
+    const upload = store.upload(input)
+    const rejected = assert.rejects(upload, /aborted/)
+    input.write(Buffer.from('payload'))
+    await waiting.promise
+    input.destroy(new Error('aborted'))
+    await rejected
+    assert.ok(pending)
+    await assert.rejects(pending, /StreamSplitter was destroyed/)
+    await held.release()
+
+    const permit = await semaphore.acquire()
+    await permit.release()
+  })
+
+  it('keeps the previous part permit until its upload settles', async () => {
+    const store = new DelayedPartStore()
+    const semaphore = store.semaphore()
+    const waiting = deferred<void>()
+    const cancelled = deferred<void>()
+    const acquire = semaphore.acquire.bind(semaphore)
+    let calls = 0
+    semaphore.acquire = (signal) => {
+      const result = acquire(signal)
+      if (++calls === 2) {
+        signal?.addEventListener('abort', () => cancelled.resolve(), {once: true})
+        waiting.resolve()
+      }
+      return result
+    }
+
+    const input = new PassThrough()
+    const upload = store.upload(input)
+    const rejected = assert.rejects(upload, /aborted/)
+    input.write(Buffer.from('12345'))
+    await store.partStarted.promise
+    await waiting.promise
+    input.destroy(new Error('aborted'))
+    await cancelled.promise
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    let nextAcquired = false
+    const next = semaphore.acquire().then((permit) => {
+      nextAcquired = true
+      return permit
+    })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.equal(nextAcquired, false)
+    store.finishPart.resolve('etag')
+    await rejected
+    await (await next).release()
+  })
+
+  it('releases capacity if a part fails while the next chunk waits', async () => {
+    const store = new DelayedPartStore()
+    const semaphore = store.semaphore()
+    const waiting = deferred<void>()
+    const acquire = semaphore.acquire.bind(semaphore)
+    let calls = 0
+    let pending: Promise<Permit> | undefined
+    semaphore.acquire = (signal) => {
+      const result = acquire(signal)
+      if (++calls === 2) {
+        pending = result
+        waiting.resolve()
+      }
+      return result
+    }
+
+    const input = new PassThrough()
+    const upload = store.upload(input)
+    const rejected = assert.rejects(upload, /part failed/)
+    input.write(Buffer.from('12345'))
+    await store.partStarted.promise
+    await waiting.promise
+    store.finishPart.reject(new Error('part failed'))
+    await rejected
+    assert.ok(pending)
+    await assert.rejects(pending, /StreamSplitter was destroyed/)
+    const permit = await semaphore.acquire()
+    await permit.release()
+  })
 })

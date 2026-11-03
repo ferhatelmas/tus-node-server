@@ -386,20 +386,25 @@ export class S3Store extends DataStore {
     let bytesUploaded = 0
     let permit: Permit | undefined
 
+    const chunkAbort = new AbortController()
     const splitterStream = new StreamSplitter({
       chunkSize: this.calcOptimalPartSize(size),
       directory: os.tmpdir(),
     })
+      .on('chunkCancelled', () =>
+        chunkAbort.abort(new Error('StreamSplitter was destroyed'))
+      )
       .on('beforeChunkStarted', async () => {
-        permit = await this.partUploadSemaphore.acquire()
+        permit = await this.partUploadSemaphore.acquire(chunkAbort.signal)
       })
       .on('chunkStarted', (filepath) => {
         pendingChunkFilepath = filepath
       })
       .on('chunkFinished', ({path, size: partSize}) => {
         pendingChunkFilepath = null
-
+        // The part upload now owns this permit until its finally block.
         const acquiredPermit = permit
+        permit = undefined
         const partNumber = currentPartNumber++
 
         offset += partSize
@@ -424,7 +429,6 @@ export class S3Store extends DataStore {
             bytesUploaded += partSize
             resolve()
           } catch (error) {
-            // If there's an error, destroy the splitter to stop processing more chunks
             splitterStream.destroy(error)
             reject(error)
           } finally {
@@ -458,7 +462,7 @@ export class S3Store extends DataStore {
     } catch (error) {
       if (pendingChunkFilepath !== null) {
         try {
-          await fsProm.rm(pendingChunkFilepath)
+          await fsProm.rm(pendingChunkFilepath, {force: true})
         } catch {
           log(`[${metadata.file.id}] failed to remove chunk ${pendingChunkFilepath}`)
         }
